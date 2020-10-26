@@ -1,0 +1,95 @@
+WITH week_numbers AS (
+	SELECT date, string, quarter, year, row_number() OVER (PARTITION BY year ORDER by dates.date asc) AS week_no
+        FROM dates
+        JOIN quarters ON dates.date <@ quarters.dates),
+
+     -- assume the freshest data is from last week
+     lw_number AS (
+	SELECT date, week_no, quarter, year
+	FROM week_numbers
+	WHERE date = (SELECT max(date) from flat)),
+
+     -- get week_no, year from last week data (wraps on the last week of the year)
+     ty_number AS (
+	SELECT
+		CASE WHEN (SELECT week_no FROM lw_number) < 52 THEN (SELECT week_no FROM lw_number) + 1
+		     ELSE 1
+		     END
+		AS week_no,
+		CASE WHEN (SELECT week_no FROM lw_number) < 52 THEN (SELECT year FROM lw_number)
+		     ELSE (SELECT year FROM lw_number) + 1
+                     END
+		AS year),
+
+     -- figure out what quarter this week corresponds to
+     quarter AS (
+	SELECT mode() WITHIN GROUP (ORDER BY quarter) AS quarter
+        FROM week_numbers
+        WHERE week_no = (SELECT week_no FROM ty_number)),
+
+     -- derive last year's week_no from this years
+     ly_number AS (
+	SELECT date, quarter, year
+	FROM week_numbers
+	WHERE week_no = (SELECT week_no FROM ty_number)
+	AND   year = (SELECT year FROM ty_number) - 1),
+
+     -- pull last week's grades
+     lw AS (
+	SELECT name, grade
+	FROM flat
+	WHERE date = (SELECT date FROM lw_number)),
+
+     -- pull last week's data
+     ly AS (
+	SELECT name, percent_on_sale, depth_of_sale, marketing_message
+	FROM flat
+	WHERE date = (SELECT date FROM ly_number)),
+
+     -- pull this year's QTD
+     ty_qtd AS (
+	SELECT name,
+               ROUND(AVG(percent_on_sale), 2) AS percent_on_sale,
+               ROUND(AVG(depth_of_sale), 2) AS depth_of_sale,
+	       COUNT(*) AS weeks
+	FROM flat
+	JOIN quarters ON flat.date <@ quarters.dates
+	WHERE year = (SELECT year FROM ty_number)
+	AND   quarter = (SELECT quarter FROM quarter)
+	GROUP BY name),
+
+     -- pull last year's QTD
+     ly_qtd AS (
+	SELECT name,
+               ROUND(AVG(percent_on_sale), 2) AS percent_on_sale,
+               ROUND(AVG(depth_of_sale), 2) AS depth_of_sale,
+	       COUNT(*) AS weeks
+	FROM flat
+	JOIN quarters ON flat.date <@ quarters.dates
+	WHERE year = (SELECT year FROM ty_number) - 1
+	AND   quarter = (SELECT quarter FROM quarter)
+	AND   date <= (SELECT date FROM ly_number)
+	GROUP BY name)
+
+SELECT
+	lw.name AS retailer,
+	lw.grade AS lw_grade,
+	ly.percent_on_sale AS ly_percent_on_sale,
+	ly.depth_of_sale AS ly_depth_of_sale,
+	ly.marketing_message AS ly_marketing_message,
+	ty_qtd.percent_on_sale AS ty_qtd_percent_on_sale,
+	ly_qtd.percent_on_sale AS ly_qtd_percent_on_sale,
+	ty_qtd.depth_of_sale AS ty_qtd_depth_of_sale,
+	ly_qtd.depth_of_sale AS ly_qtd_depth_of_sale,
+	ty_qtd.weeks AS ty_qtr_weeks,
+	ly_qtd.weeks AS ly_qtr_weeks
+INTO TEMP o
+FROM
+	lw
+	   LEFT JOIN ly     USING (name)
+	   LEFT JOIN ly_qtd USING (name)
+	   LEFT JOIN ty_qtd USING (name)
+ORDER BY ly.name;
+
+
+\COPY o TO sheet_prep.csv WITH HEADER CSV

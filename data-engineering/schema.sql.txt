@@ -1,0 +1,231 @@
+-- PostgreSQL database dump
+-- Dumped by pg_dump
+
+SET client_encoding = 'UTF8';
+CREATE EXTENSION IF NOT EXISTS btree_gist WITH SCHEMA public;
+COMMENT ON EXTENSION btree_gist IS 'support for indexing common datatypes in GiST';
+CREATE EXTENSION IF NOT EXISTS tablefunc WITH SCHEMA public;
+COMMENT ON EXTENSION tablefunc IS 'functions that manipulate whole tables, including crosstab';
+
+CREATE TYPE public.grade AS ENUM (
+    'A',
+    'B',
+    'C',
+    'D'
+);
+
+CREATE TYPE public.quarter AS ENUM (
+    'Q1',
+    'Q2',
+    'Q3',
+    'Q4'
+);
+
+CREATE TABLE public.dates (
+    id integer NOT NULL,
+    date date NOT NULL,
+    string text NOT NULL
+);
+
+CREATE SEQUENCE public.dates_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+ALTER TABLE ONLY public.dates ALTER COLUMN id SET DEFAULT nextval('public.dates_id_seq'::regclass);
+ALTER TABLE ONLY public.dates
+    ADD CONSTRAINT dates_date_key UNIQUE (date);
+ALTER TABLE ONLY public.dates
+    ADD CONSTRAINT dates_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.dates
+    ADD CONSTRAINT dates_string_key UNIQUE (string);
+
+CREATE TABLE public.quarters (
+    quarter public.quarter NOT NULL,
+    year integer NOT NULL,
+    dates daterange NOT NULL
+);
+
+ALTER TABLE ONLY public.quarters
+    ADD CONSTRAINT quarters_dates_excl EXCLUDE USING gist (dates WITH &&);
+ALTER TABLE ONLY public.quarters
+    ADD CONSTRAINT quarters_year_quarter_key UNIQUE (year, quarter);
+ALTER TABLE ONLY public.quarters
+    ADD CONSTRAINT quarters_dates_excl EXCLUDE USING gist (dates WITH &&);
+ALTER TABLE ONLY public.quarters
+    ADD CONSTRAINT quarters_year_quarter_key UNIQUE (year, quarter);
+
+CREATE TABLE public.week_nos (
+    id integer,
+    date date,
+    string text,
+    week_no bigint
+);
+
+CREATE TABLE public.retailers (
+    id integer NOT NULL,
+    label text
+);
+
+CREATE SEQUENCE public.retailers_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+ALTER TABLE ONLY public.retailers ALTER COLUMN id SET DEFAULT nextval('public.retailers_id_seq'::regclass);
+ALTER TABLE ONLY public.retailers
+    ADD CONSTRAINT retailers_pkey PRIMARY KEY (id);
+
+CREATE TABLE public.qual_facts (
+    retailer_id integer NOT NULL,
+    date_id integer NOT NULL,
+    marketing_message text,
+    comments text
+);
+
+ALTER TABLE ONLY public.qual_facts
+    ADD CONSTRAINT qual_facts_retailer_id_date_id_key UNIQUE (retailer_id, date_id);
+ALTER TABLE ONLY public.qual_facts
+    ADD CONSTRAINT qual_facts_date_id_fkey FOREIGN KEY (date_id) REFERENCES public.dates(id);
+ALTER TABLE ONLY public.qual_facts
+    ADD CONSTRAINT qual_facts_retailer_id_fkey FOREIGN KEY (retailer_id) REFERENCES public.retailers(id);
+
+CREATE TABLE public.quant_facts (
+    retailer_id integer NOT NULL,
+    date_id integer NOT NULL,
+    grade public.grade NOT NULL,
+    percent_on_sale numeric NOT NULL,
+    depth_of_sale numeric NOT NULL,
+    CONSTRAINT quant_facts_depth_of_sale_check CHECK ((depth_of_sale = ANY (ARRAY[(0)::numeric, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, (1)::numeric]))),
+    CONSTRAINT quant_facts_percent_on_sale_check CHECK ((percent_on_sale = ANY (ARRAY[(0)::numeric, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, (1)::numeric])))
+);
+
+ALTER TABLE ONLY public.quant_facts
+    ADD CONSTRAINT quant_facts_retailer_id_date_id_key UNIQUE (retailer_id, date_id);
+ALTER TABLE ONLY public.quant_facts
+    ADD CONSTRAINT quant_facts_date_id_fkey FOREIGN KEY (date_id) REFERENCES public.dates(id);
+ALTER TABLE ONLY public.quant_facts
+    ADD CONSTRAINT quant_facts_retailer_id_fkey FOREIGN KEY (retailer_id) REFERENCES public.retailers(id);
+
+CREATE TABLE public.retailer_facts (
+    retailer_id integer NOT NULL,
+    name text NOT NULL,
+    ticker text,
+    category text,
+    dates_effective daterange NOT NULL
+);
+
+ALTER TABLE ONLY public.retailer_facts
+    ADD CONSTRAINT retailer_facts_retailer_id_dates_effective_excl EXCLUDE USING gist (retailer_id WITH =, dates_effective WITH &&);
+ALTER TABLE ONLY public.retailer_facts
+    ADD CONSTRAINT retailer_facts_retailer_id_fkey FOREIGN KEY (retailer_id) REFERENCES public.retailers(id);
+
+CREATE VIEW public.flat AS
+ SELECT d.date,
+    d.string,
+    r.name,
+    r.ticker,
+    r.category,
+    n.grade,
+    n.percent_on_sale,
+    n.depth_of_sale,
+    t.marketing_message,
+    t.comments
+   FROM (((public.quant_facts n
+     FULL JOIN public.qual_facts t USING (retailer_id, date_id))
+     LEFT JOIN public.dates d ON (((d.id = n.date_id) OR (d.id = t.date_id))))
+     LEFT JOIN public.retailer_facts r(retailer_id_1, name, ticker, category, dates_effective) ON ((((r.retailer_id_1 = n.retailer_id) OR (r.retailer_id_1 = t.retailer_id)) AND (r.dates_effective @> d.date))));
+
+CREATE FUNCTION public.retailer_facts_insert() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  c integer;
+
+  name_o text;
+  ticker_o text;
+  category_o text;
+  dates_effective_o daterange;
+
+  l_inf boolean := false;
+  r_inf boolean := false;
+
+BEGIN
+  SELECT count(*) INTO c
+  FROM retailer_facts AS r
+  WHERE r.retailer_id = NEW.retailer_id
+    AND r.dates_effective && NEW.dates_effective;
+
+  CASE c
+    WHEN 0 THEN
+      RETURN NEW;
+    WHEN 1 THEN
+      SELECT name, ticker, category, dates_effective
+      INTO name_o, ticker_o, category_o, dates_effective_o
+      FROM retailer_facts AS r
+      WHERE r.retailer_id = NEW.retailer_id
+      AND r.dates_effective && NEW.dates_effective;
+
+      IF NEW.name = name_o AND
+         NEW.ticker = ticker_o -- AND
+         -- NEW.category = category_o
+      THEN
+        IF (NEW.dates_effective <@ dates_effective_o) THEN
+          RETURN NULL;
+        ELSE
+          UPDATE retailer_facts
+          SET dates_effective = dates_effective_o + NEW.dates_effective
+          WHERE retailer_id = NEW.retailer_id
+          AND dates_effective && NEW.dates_effective;
+          RETURN NULL;
+        END IF;
+      END IF;
+
+      -- handle the case where NEW is unbounded
+      SELECT lower_inf(NEW.dates_effective), upper_inf(NEW.dates_effective)
+      INTO l_inf, r_inf;
+
+      IF l_inf AND dates_effective_o <@ NEW.dates_effective THEN
+        NEW.dates_effective := daterange(upper(dates_effective_o), upper(NEW.dates_effective), '(]');
+        RETURN NEW;
+      END IF;
+
+      IF r_inf AND dates_effective_o <@ NEW.dates_effective THEN
+        NEW.dates_effective := daterange(lower(NEW.dates_effective), lower(dates_effective_o), '[)');
+        RETURN NEW;
+      END IF;
+
+      -- handle the case where other is unbounded
+      SELECT lower_inf(dates_effective_o), upper_inf(dates_effective_o)
+      INTO l_inf, r_inf;
+
+      IF l_inf AND dates_effective_o @> NEW.dates_effective THEN
+        UPDATE retailer_facts
+        SET dates_effective = daterange(upper(NEW.dates_effective), upper(dates_effective_o),'(]')
+        WHERE retailer_id = NEW.retailer_id
+        AND dates_effective && NEW.dates_effective;
+        RETURN NULL;
+      END IF;
+
+      IF r_inf AND dates_effective_o @> NEW.dates_effective THEN
+        UPDATE retailer_facts
+        SET dates_effective = daterange(lower(dates_effective_o), lower(NEW.dates_effective), '[)')
+        WHERE retailer_id = NEW.retailer_id
+        AND dates_effective && NEW.dates_effective;
+        RETURN NULL;
+      END IF;
+
+      RAISE EXCEPTION '% and % overlap', NEW.dates_effective, dates_effective_o;
+    ELSE
+      RAISE EXCEPTION 'dates_effective: % overlaps with more than one other range', NEW.dates_effective;
+  END CASE;
+END;
+$$;
+
+CREATE TRIGGER retailer_facts_insert BEFORE INSERT ON public.retailer_facts FOR EACH ROW EXECUTE FUNCTION public.retailer_facts_insert();
